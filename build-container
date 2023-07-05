@@ -1,0 +1,93 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+TAG=""
+PUSH=""
+
+# process opts
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -t|--tag)
+        TAG="$2"
+        shift
+        shift
+        ;;
+    --push)
+        PUSH=1
+        shift
+        ;;
+    *)
+        echo "unknown option: $1" >&2
+        exit 1
+        ;;
+    esac
+done
+
+if [[ -n "$PUSH" && -z "$TAG" ]]; then
+    echo "cannot use --push without --tag" >&2
+    exit 1
+fi
+
+# Set CARGO_HOME to its default if not set, we will mount it in to builder
+: "${CARGO_HOME:=$HOME/.cargo}"
+
+mkdir -p .build
+mkdir -p .build/cargo-target
+
+build-rust() {
+    local src_path="$1"
+    shift
+
+    local absolute_src_path="$(readlink -e "$src_path")"
+
+    # Run the build in the builder container, but with target dir from outside
+    # the container mounted in. This lets us take direct advantage of Cargo's
+    # incremental compilation and avoid complicated layers of caching if we
+    # were to build sccache in a Docker image build.
+    docker run \
+        -v "$absolute_src_path":/tmp/src:ro \
+        -v "$(pwd)/.build/cargo-target":/tmp/target \
+        -v "$CARGO_HOME":/tmp/cargo \
+        -e CARGO_TARGET_DIR=/tmp/target \
+        -e CARGO_HOME=/tmp/cargo \
+        -w /tmp/src \
+        --tty \
+        --interactive \
+        --user "$(id -u):$(id -g)" \
+        "$CONTAINER_BUILDER_IMAGE" \
+        cargo build --release --target=x86_64-unknown-linux-musl "$@"
+}
+
+echo --- Building container builder image
+docker build \
+    -f container.dockerfile \
+    --target builder \
+    --iidfile ".build/image-container-builder" \
+    .
+
+CONTAINER_BUILDER_IMAGE="$(< .build/image-container-builder)"
+
+echo --- Building sccache
+build-rust sccache --bin sccache-dist --features all,dist-server
+
+echo --- Building worker
+build-rust worker
+
+echo --- Building container image
+docker build \
+    -f container.dockerfile \
+    --target container \
+    --iidfile ".build/image-container" \
+    .
+
+if [[ -n "$TAG" ]]; then
+    echo --- Tagging container image
+    docker tag "$(< .build/image-container)" "$TAG"
+    echo "==> $TAG"
+fi
+
+if [[ -n "$PUSH" ]]; then
+    echo --- Pushing container image
+    docker push "$TAG"
+fi

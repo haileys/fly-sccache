@@ -1,0 +1,8 @@
+#!/bin/bash
+
+FLY_APP=fly-sccache
+
+fly m run \
+    --rm \
+    --name worker-0 \
+    registry.fly.io/fly-sccache:worker-v0
